@@ -9,6 +9,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -56,6 +57,8 @@ parser.add_argument('-nopatchdemo', action='store_false', default=True,
                     dest='patch_demo', help='This will disable patching the demo play limit')
 parser.add_argument('-all', action='store_true', default=False, dest='download_all',
                     help='Downloads/gets tickets for EVERYTHING from the keyfile')
+parser.add_argument('-verbose', action='store_true', default=False, dest='verbose',
+                    help='Verbose logging')
 
 
 def bytes2human(n, f='%(value).2f %(symbol)s', symbols='customary'):
@@ -88,7 +91,7 @@ def retry(count):
 
 
 def progress_bar(part, total, length=10, char='#', blank=' ', left='[', right=']'):
-    percent = int((float(part) / float(total) * 100) % 100)
+    percent = float(part) / float(total)
     bar_len = int((float(part) / float(total) * length) % length)
     bar = char * bar_len
     blanks = blank * (length - bar_len)
@@ -98,10 +101,17 @@ def progress_bar(part, total, length=10, char='#', blank=' ', left='[', right=']
 
 
 def download_file(url, outfname, retry_count=3, ignore_404=False, expected_size=None, chunk_size=0x4096):
+    logging.info("Downloading {} to {}".format(url, outfname))
     for _ in retry(retry_count):
         try:
             infile = urlopen(url)
+            content_length = int(infile.headers.get('Content-Length', 0))
 
+            if expected_size and content_length != expected_size:
+                print("Content length mismatch, server says {}".format(content_length))
+
+            logging.info("Content length {}".format(content_length))
+            
             with open(outfname, 'wb') as outfile:
                 downloaded_size = 0
                 while True:
@@ -109,16 +119,15 @@ def download_file(url, outfname, retry_count=3, ignore_404=False, expected_size=
                     if not buf:
                         break
                     downloaded_size += len(buf)
-                    if expected_size and len(buf) == chunk_size:
-                        print(' Downloaded {}'.format(progress_bar(downloaded_size, expected_size)), end='\r')
+                    if content_length and len(buf) == chunk_size:
+                        print(' Downloaded {}'.format(progress_bar(downloaded_size, content_length)), end='\r')
                     outfile.write(buf)
 
-            if expected_size is not None:
-                if int(os.path.getsize(outfname)) != expected_size:
-                    print('Content download not correct size\n')
-                    continue
-                else:
-                    print(' Download complete: {}'.format(bytes2human(downloaded_size)) + ' ' * 40)
+            if content_length and int(os.path.getsize(outfname)) != content_length:
+                print('Content download not correct size\n')
+                continue
+            else:
+                print(' Download complete: {}'.format(bytes2human(downloaded_size)) + ' ' * 40)
         except HTTPError as e:
             if e.code == 404 and ignore_404:
                 # We are ignoring this because its a 404 error, not a failure
@@ -206,7 +215,7 @@ def safe_filename(filename):
     >>> print(safe_filename("幻影異聞録♯ＦＥ"))
     幻影異聞録_ＦＥ
     """
-    keep = ' ._'
+    keep = ' .-_'
     return re.sub(r'_+', '_', ''.join(c if (c.isalnum() or c in keep) else '_' for c in filename)).strip('_ ')
 
 
@@ -229,6 +238,7 @@ def process_title_id(title_id, title_key, name=None, output_dir=None, retry_coun
         rawdir = os.path.join(output_dir, rawdir)
 
     if not os.path.exists(rawdir):
+        logging.info("Making folder {}".format(rawdir))
         os.makedirs(os.path.join(rawdir))
 
     # download stuff
@@ -242,9 +252,11 @@ def process_title_id(title_id, title_key, name=None, output_dir=None, retry_coun
         return
 
     with open(os.path.join(rawdir, 'title.cert'), 'wb') as f:
+        logging.info("Writing title.cert")
         f.write(MAGIC)
 
     with open(tmd_path, 'rb') as f:
+        logging.info("Writing title.tmd")
         tmd = f.read()
 
     title_version = tmd[TK + 0x9C:TK + 0x9E]
@@ -252,18 +264,21 @@ def process_title_id(title_id, title_key, name=None, output_dir=None, retry_coun
     # get ticket from keysite, from cdn if game update, or generate ticket
     if onlinetickets:
         if typecheck == '000e':
+            logging.info("Downloading update ticket from cdn")
             if not download_file(baseurl + '/cetk', os.path.join(rawdir, 'title.tik'), retry_count):
                 print('ERROR: Could not download CETK...')
                 print('Skipping title...')
                 return
         else:
             keysite = get_keysite()
+            logging.info("downloading ticket from {}".format(keysite))
             tikurl = 'https://{}/ticket/{}.tik'.format(keysite, title_id)
             if not download_file(tikurl, os.path.join(rawdir, 'title.tik'), retry_count):
                 print('ERROR: Could not download ticket from {}'.format(keysite))
                 print('Skipping title...')
                 return
     else:
+        logging.info("Making ticket")
         make_ticket(title_id, title_key, title_version, os.path.join(rawdir, 'title.tik'), patch_demo, patch_dlc)
 
     print('Downloading Contents...')
@@ -281,14 +296,14 @@ def process_title_id(title_id, title_key, name=None, output_dir=None, retry_coun
         c_type = binascii.hexlify(tmd[c_offs + 0x06:c_offs + 0x8])
         expected_size = int(binascii.hexlify(tmd[c_offs + 0x08:c_offs + 0x10]), 16)
         print('Downloading {} of {}.'.format(i + 1, content_count))
-        outfname = os.path.join(rawdir, c_id + '.app')
-        outfnameh3 = os.path.join(rawdir, c_id + '.h3')
-
-        if not download_file('{}/{}'.format(baseurl, c_id), outfname, retry_count, expected_size=expected_size):
+        outfname = os.path.join(rawdir, c_id)
+        logging.info("Downloading {}.app".format(c_id))
+        if not download_file('{}/{}'.format(baseurl, c_id), outfname + '.app', retry_count, expected_size=expected_size):
             print('ERROR: Could not download content file... Skipping title')
             return
         if c_type == "2003":
-            if not download_file('{}/{}.h3'.format(baseurl, c_id), outfnameh3, retry_count):
+            logging.info("Downloading {}.h3".format(c_id))
+            if not download_file('{}/{}.h3'.format(baseurl, c_id), outfname + '.h3', retry_count): 
                 print('ERROR: Could not download h3 file... Skipping title')
                 return
 
@@ -382,6 +397,10 @@ def main(titles=None, keys=None, onlinekeys=False, onlinetickets=False, download
 
 if __name__ == '__main__':
     arguments = parser.parse_args()
+
+    if arguments.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+
     main(titles=arguments.titles,
          keys=arguments.keys,
          onlinekeys=arguments.onlinekeys,
